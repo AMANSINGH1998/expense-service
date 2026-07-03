@@ -127,4 +127,51 @@ describe("SubmitExpenseUseCase", () => {
     if (!r.ok) expect(r.error.code).toBe("POLICY_NOT_FOUND");
     expect(svc.repos.expenses.all().length).toBe(1);
   });
+
+  describe("error handling", () => {
+    it("rejects a non-positive amount with INVALID_COMMAND (no expense stored)", async () => {
+      const r = await svc.submitExpense.execute(cmd({ amountMajor: 0 }));
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.code).toBe("INVALID_COMMAND");
+      expect(svc.repos.expenses.all().length).toBe(0);
+    });
+
+    it("rejects a missing currency with INVALID_COMMAND", async () => {
+      const r = await svc.submitExpense.execute(cmd({ currency: "" }));
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.code).toBe("INVALID_COMMAND");
+    });
+
+    it("rejects an unknown category with INVALID_COMMAND", async () => {
+      const r = await svc.submitExpense.execute(
+        cmd({ category: "GADGETS" as never }),
+      );
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.code).toBe("INVALID_COMMAND");
+    });
+
+    it("returns FX_RATE_MISSING (not a throw) when no rate is configured", async () => {
+      // This service has no INR->USD rate configured.
+      const noFx = buildExpenseService({
+        clock: new FixedClock(new Date("2026-07-15T10:00:00Z")),
+        ids: new SequentialIdGenerator("exp"),
+        fxRates: {},
+      });
+      await noFx.configurePolicy.execute(SAMPLE_POLICY);
+      await seedBudget(noFx.repos.budgets, {
+        id: "b1",
+        departmentId: "eng",
+        employerId: "acme-usa",
+        period: PERIOD,
+        currency: "USD",
+        allocatedMajor: 5000,
+      });
+      const r = await noFx.submitExpense.execute(cmd({ currency: "INR", amountMajor: 2500 }));
+      expect(r.ok).toBe(false);
+      // The FX provider's own DomainError code is preserved.
+      if (!r.ok) expect(r.error.code).toBe("FX_RATE_MISSING");
+      // Expense was recorded first, before the FX failure.
+      expect(noFx.repos.expenses.all().length).toBe(1);
+    });
+  });
 });

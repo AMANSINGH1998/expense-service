@@ -77,21 +77,36 @@ export class SubmitExpenseUseCase {
   ) {}
 
   async execute(cmd: SubmitExpenseCommand): Promise<Result<SubmitExpenseResult>> {
+    // --- Step 0: validate the command before touching any domain. ---
+    const invalid = this.validate(cmd);
+    if (invalid) {
+      return err(invalid);
+    }
     const policyId = asPolicyId(cmd.policyId);
 
     // --- Step 1: build and PERSIST the expense first (status SUBMITTED). ---
-    const expense = Expense.submit({
-      id: asExpenseId(this.ids.next()),
-      employeeId: asEmployeeId(cmd.employeeId),
-      employerId: asEmployerId(cmd.employerId),
-      departmentId: asDepartmentId(cmd.departmentId),
-      policyId,
-      category: cmd.category,
-      amount: Money.of(cmd.amountMajor, cmd.currency),
-      description: cmd.description,
-      submittedAt: this.clock.now(),
-    });
-    await this.expenses.save(expense);
+    // Construction validates the amount and can throw; convert to a Result.
+    let expense: Expense;
+    try {
+      expense = Expense.submit({
+        id: asExpenseId(this.ids.next()),
+        employeeId: asEmployeeId(cmd.employeeId),
+        employerId: asEmployerId(cmd.employerId),
+        departmentId: asDepartmentId(cmd.departmentId),
+        policyId,
+        category: cmd.category,
+        amount: Money.of(cmd.amountMajor, cmd.currency),
+        description: cmd.description,
+        submittedAt: this.clock.now(),
+      });
+    } catch (e) {
+      return this.fail(e, "INVALID_EXPENSE");
+    }
+    try {
+      await this.expenses.save(expense);
+    } catch (e) {
+      return this.fail(e, "EXPENSE_PERSIST_FAILED");
+    }
 
     // --- Step 2: gather context OUTSIDE the lock (read-only, may be expensive). ---
     const policy = await this.policies.findById(policyId);
@@ -110,25 +125,42 @@ export class SubmitExpenseUseCase {
       );
     }
 
-    const amountInBudgetCurrency = this.fx.convert(expense.amount, budget.currency);
+    // FX conversion can throw when a rate is unconfigured — surface it cleanly.
+    let amountInBudgetCurrency: Money;
+    try {
+      amountInBudgetCurrency = this.fx.convert(expense.amount, budget.currency);
+    } catch (e) {
+      return this.fail(e, "FX_CONVERSION_FAILED");
+    }
 
     // Optimistic evaluation (telemetry / fail-fast only — not authoritative).
-    this.evaluate(
-      policy,
-      expense,
-      amountInBudgetCurrency,
-      budget,
-      await this.loadCumulative(expense.employeeId, budget.currency, expense),
-    );
+    // A misconfigured rule (e.g. a numeric operator on a text field) throws
+    // here; treat it as a policy-evaluation failure rather than crashing.
+    try {
+      this.evaluate(
+        policy,
+        expense,
+        amountInBudgetCurrency,
+        budget,
+        await this.loadCumulative(expense.employeeId, budget.currency, expense),
+      );
+    } catch (e) {
+      return this.fail(e, "POLICY_EVALUATION_FAILED");
+    }
 
     // --- Step 3: minimal critical section, locked on the POLICY. ---
     // A department's expenses are governed by a single policy, so serializing
     // per-policy serializes the budget/ledger reads-and-writes behind the
-    // decision. Only fresh reads + one state transition happen in here.
-    const finalized = await this.locks.withLock<Finalized>(
-      `policy:${policyId}`,
-      () => this.finalizeUnderLock(policy, expense, amountInBudgetCurrency),
-    );
+    // decision. Only fresh reads + one state transition happen in here. Any
+    // failure inside the lock is converted to a Result so execute never rejects.
+    let finalized: Finalized;
+    try {
+      finalized = await this.locks.withLock<Finalized>(`policy:${policyId}`, () =>
+        this.finalizeUnderLock(policy, expense, amountInBudgetCurrency),
+      );
+    } catch (e) {
+      return this.fail(e, "EXPENSE_PROCESSING_FAILED");
+    }
 
     return ok({
       expenseId: expense.id,
@@ -138,6 +170,48 @@ export class SubmitExpenseUseCase {
       amountInBudgetCurrency:
         finalized.reimbursementId !== null ? amountInBudgetCurrency.toString() : null,
     });
+  }
+
+  /** Validate the raw command. Returns a DomainError to return, or null if ok. */
+  private validate(cmd: SubmitExpenseCommand): DomainError | null {
+    const required: Array<keyof SubmitExpenseCommand> = [
+      "employeeId",
+      "employerId",
+      "departmentId",
+      "policyId",
+      "currency",
+    ];
+    for (const field of required) {
+      const value = cmd[field];
+      if (typeof value !== "string" || value.trim() === "") {
+        return new DomainError("INVALID_COMMAND", `Missing or empty field: ${field}`);
+      }
+    }
+    if (
+      typeof cmd.amountMajor !== "number" ||
+      !Number.isFinite(cmd.amountMajor) ||
+      cmd.amountMajor <= 0
+    ) {
+      return new DomainError("INVALID_COMMAND", "amountMajor must be a positive, finite number");
+    }
+    const categories: ExpenseCategory[] = ["MEALS", "TRAVEL", "LODGING", "SOFTWARE", "OTHER"];
+    if (!categories.includes(cmd.category)) {
+      return new DomainError("INVALID_COMMAND", `Unknown expense category: ${cmd.category}`);
+    }
+    return null;
+  }
+
+  /**
+   * Turn a caught throwable into a Result error. Known DomainErrors keep their
+   * own code (they are already meaningful); anything else is wrapped with the
+   * supplied fallback code so the caller still gets a typed error.
+   */
+  private fail(e: unknown, fallbackCode: string): Result<SubmitExpenseResult> {
+    if (e instanceof DomainError) {
+      return err(e);
+    }
+    const message = e instanceof Error ? e.message : String(e);
+    return err(new DomainError(fallbackCode, message));
   }
 
   /** Runs inside the lock: fresh re-read, authoritative re-evaluation, one write. */
@@ -204,6 +278,9 @@ export class SubmitExpenseUseCase {
     amountInBudgetCurrency: Money,
     decision: PolicyDecision,
   ): Promise<Finalized> {
+    // Snapshot the budget BEFORE mutating so we can compensate on a later failure.
+    const budgetBeforeDeduction = budget.snapshot();
+
     const deducted = budget.deduct(amountInBudgetCurrency);
     if (!deducted.ok) {
       // Budget cannot cover it right now -> reject rather than auto-approve.
@@ -218,15 +295,44 @@ export class SubmitExpenseUseCase {
       return { decision: rejectDecision, reimbursementId: null };
     }
 
-    await this.budgets.save(budget);
-    await this.persistTransition(expense, () =>
-      expense.approve(decision.reason, decision.matchedRuleName),
-    );
-    const txn = await this.reimbursementManager.recordApprovedReimbursement(
-      expense,
-      amountInBudgetCurrency,
-    );
-    return { decision, reimbursementId: txn.id };
+    // Do the in-memory transition first: if it fails, nothing has been persisted
+    // yet, so there is nothing to roll back.
+    const approved = expense.approve(decision.reason, decision.matchedRuleName);
+    if (!approved.ok) {
+      throw approved.error;
+    }
+
+    // Persist in an order that avoids leaving an APPROVED expense with no
+    // reimbursement: save the budget, record the money movement, then write the
+    // expense's terminal state LAST. If any step throws, compensate by rolling
+    // the budget back to its pre-deduction state.
+    //
+    // NOTE: fully atomic cross-aggregate writes require a transactional outbox /
+    // unit-of-work at the infrastructure boundary; this is a best-effort
+    // compensation suitable for the in-memory prototype.
+    try {
+      await this.budgets.save(budget);
+      const txn = await this.reimbursementManager.recordApprovedReimbursement(
+        expense,
+        amountInBudgetCurrency,
+      );
+      await this.expenses.save(expense);
+      return { decision, reimbursementId: txn.id };
+    } catch (e) {
+      await this.safeRestoreBudget(budgetBeforeDeduction);
+      throw e;
+    }
+  }
+
+  /** Best-effort restore of a budget to a prior snapshot (compensation). */
+  private async safeRestoreBudget(
+    props: ReturnType<DepartmentalBudget["snapshot"]>,
+  ): Promise<void> {
+    try {
+      await this.budgets.save(DepartmentalBudget.rehydrate({ ...props }));
+    } catch {
+      // Nothing more we can safely do here; the outer error is already bubbling.
+    }
   }
 
   /** Apply a domain transition and persist; domain errors surface as throws. */
