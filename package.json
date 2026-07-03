@@ -1,0 +1,19 @@
+{
+  "name": "expense-service",
+  "version": "1.0.0",
+  "description": "Production-shaped Expense Service (DDD + SOLID) with dynamic policy engine, minimal locking, currency conversion and double-entry accounting.",
+  "type": "module",
+  "scripts": {
+    "start": "node dist/demo/main.js",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "demo": "tsx src/demo/main.ts",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
